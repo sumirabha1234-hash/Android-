@@ -29,6 +29,8 @@ import {
   HelpCircle,
   Award,
   Filter,
+  FileText,
+  AlignLeft,
 } from 'lucide-react';
 import { DecompiledFileItem, SecurityVulnerability, VulnerabilitySeverity, SourceRecoveryStats } from '../types';
 import { locateVulnerabilitiesInFile, CodeFinding } from '../lib/vulnerability-locator';
@@ -53,9 +55,14 @@ interface TreeNode {
   hasHigh: boolean;
   hasMedium: boolean;
   retrievalScore?: number;
+  contentMatchesCount?: number;
 }
 
-function buildFileTree(files: DecompiledFileItem[], vulnerabilities: SecurityVulnerability[]): TreeNode[] {
+function buildFileTree(
+  files: DecompiledFileItem[],
+  vulnerabilities: SecurityVulnerability[],
+  searchMatchesMap?: Map<string, number>
+): TreeNode[] {
   const rootNodes: TreeNode[] = [];
 
   const fileFindingsMap = new Map<string, CodeFinding[]>();
@@ -76,6 +83,7 @@ function buildFileTree(files: DecompiledFileItem[], vulnerabilities: SecurityVul
 
       if (!existingNode) {
         const findings = isFile ? fileFindingsMap.get(file.path) || [] : [];
+        const contentMatchCount = isFile ? (searchMatchesMap?.get(file.path) || 0) : 0;
         const newNode: TreeNode = {
           id: accumulatedPath,
           name: part,
@@ -88,6 +96,7 @@ function buildFileTree(files: DecompiledFileItem[], vulnerabilities: SecurityVul
           hasHigh: isFile ? findings.some((f) => f.severity === 'high') : false,
           hasMedium: isFile ? findings.some((f) => f.severity === 'medium') : false,
           retrievalScore: isFile ? (file.retrievalScore ?? 98.0) : undefined,
+          contentMatchesCount: contentMatchCount,
         };
         currentLevel.push(newNode);
         existingNode = newNode;
@@ -105,6 +114,7 @@ function buildFileTree(files: DecompiledFileItem[], vulnerabilities: SecurityVul
         node.hasCritical = node.children.some((c) => c.hasCritical);
         node.hasHigh = node.children.some((c) => c.hasHigh);
         node.hasMedium = node.children.some((c) => c.hasMedium);
+        node.contentMatchesCount = node.children.reduce((acc, c) => acc + (c.contentMatchesCount || 0), 0);
       }
     });
 
@@ -127,6 +137,7 @@ interface TreeItemProps {
   expandedFolders: Set<string>;
   onToggleFolder: (path: string) => void;
   searchQuery: string;
+  searchScope: 'all' | 'name' | 'content';
 }
 
 const TreeItem: React.FC<TreeItemProps> = ({
@@ -137,17 +148,33 @@ const TreeItem: React.FC<TreeItemProps> = ({
   expandedFolders,
   onToggleFolder,
   searchQuery,
+  searchScope,
 }) => {
   const isFolder = node.type === 'folder';
   const isExpanded = expandedFolders.has(node.path);
   const isSelected = selectedFilePath === node.path;
 
-  const matchesSearch =
-    searchQuery === '' ||
-    node.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    node.path.toLowerCase().includes(searchQuery.toLowerCase());
+  const query = searchQuery.trim().toLowerCase();
+  let matchesSearch = true;
+  if (query !== '') {
+    if (isFolder) {
+      matchesSearch = (node.contentMatchesCount || 0) > 0 ||
+        node.name.toLowerCase().includes(query) ||
+        node.path.toLowerCase().includes(query);
+    } else {
+      if (searchScope === 'name') {
+        matchesSearch = node.name.toLowerCase().includes(query) || node.path.toLowerCase().includes(query);
+      } else if (searchScope === 'content') {
+        matchesSearch = (node.contentMatchesCount || 0) > 0;
+      } else {
+        matchesSearch = (node.contentMatchesCount || 0) > 0 ||
+          node.name.toLowerCase().includes(query) ||
+          node.path.toLowerCase().includes(query);
+      }
+    }
+  }
 
-  if (!matchesSearch && !isFolder) {
+  if (!matchesSearch) {
     return null;
   }
 
@@ -203,6 +230,16 @@ const TreeItem: React.FC<TreeItemProps> = ({
         </div>
 
         <div className="flex items-center gap-1 shrink-0 ml-1">
+          {/* Content Search Matches Count Badge */}
+          {query !== '' && (node.contentMatchesCount || 0) > 0 && (
+            <span
+              className="text-[9px] font-mono px-1 py-0.2 rounded font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40"
+              title={`${node.contentMatchesCount} string occurrence(s) in this ${node.type}`}
+            >
+              {node.contentMatchesCount} match{node.contentMatchesCount === 1 ? '' : 'es'}
+            </span>
+          )}
+
           {/* 0-100% Decompile Retrieval Badge */}
           {!isFolder && node.retrievalScore !== undefined && (
             <span
@@ -251,6 +288,7 @@ const TreeItem: React.FC<TreeItemProps> = ({
               expandedFolders={expandedFolders}
               onToggleFolder={onToggleFolder}
               searchQuery={searchQuery}
+              searchScope={searchScope}
             />
           ))}
         </div>
@@ -269,7 +307,9 @@ export const CodeExplorerTab: React.FC<CodeExplorerTabProps> = ({
     initialSelectedPath || (files.length > 0 ? files[0].path : 'AndroidManifest.xml')
   );
   const [viewMode, setViewMode] = useState<'tree' | 'flat'>('tree');
-  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [globalSearch, setGlobalSearch] = useState<string>('');
+  const [searchScope, setSearchScope] = useState<'all' | 'name' | 'content'>('all');
+  const [caseSensitive, setCaseSensitive] = useState<boolean>(false);
   const [inCodeSearch, setInCodeSearch] = useState<string>('');
   const [fileFilter, setFileFilter] = useState<'all' | 'java' | 'smali' | 'xml' | 'res' | 'lib'>('all');
   const [activeCodeView, setActiveCodeView] = useState<'java' | 'kotlin' | 'deobfuscated' | 'smali' | 'audit'>('java');
@@ -313,21 +353,116 @@ export const CodeExplorerTab: React.FC<CodeExplorerTabProps> = ({
     }
   }, [initialSelectedPath]);
 
-  // Filter files based on selected category tab
+  // Global search matching count across files
+  const searchMatchStats = useMemo(() => {
+    const trimmed = globalSearch.trim();
+    if (!trimmed) {
+      return {
+        map: new Map<string, number>(),
+        totalMatches: 0,
+        matchingFilesCount: 0,
+        snippetsMap: new Map<string, { line: number; text: string }[]>(),
+      };
+    }
+
+    const query = caseSensitive ? trimmed : trimmed.toLowerCase();
+    const map = new Map<string, number>();
+    const snippetsMap = new Map<string, { line: number; text: string }[]>();
+    let totalMatches = 0;
+    let matchingFilesCount = 0;
+
+    files.forEach((f) => {
+      const fullText = (f.content || '') + ' ' + (f.kotlinContent || '') + ' ' + (f.smaliContent || '') + ' ' + (f.deobfuscatedContent || '');
+      const searchTarget = caseSensitive ? fullText : fullText.toLowerCase();
+
+      let occurrences = 0;
+      let pos = 0;
+      while ((pos = searchTarget.indexOf(query, pos)) !== -1) {
+        occurrences++;
+        pos += query.length;
+      }
+
+      // Collect snippet lines from current active or default content
+      const lines = (f.content || '').split('\n');
+      const snippets: { line: number; text: string }[] = [];
+      lines.forEach((lineText, lineIdx) => {
+        const lineTarget = caseSensitive ? lineText : lineText.toLowerCase();
+        if (lineTarget.includes(query) && snippets.length < 5) {
+          snippets.push({ line: lineIdx + 1, text: lineText.trim() });
+        }
+      });
+
+      const fileNameMatches = caseSensitive ? f.name.includes(trimmed) || f.path.includes(trimmed) : f.name.toLowerCase().includes(query) || f.path.toLowerCase().includes(query);
+
+      if (occurrences > 0 || (searchScope !== 'content' && fileNameMatches)) {
+        matchingFilesCount++;
+        totalMatches += occurrences || (fileNameMatches ? 1 : 0);
+      }
+
+      map.set(f.path, occurrences);
+      snippetsMap.set(f.path, snippets);
+    });
+
+    return { map, totalMatches, matchingFilesCount, snippetsMap };
+  }, [files, globalSearch, caseSensitive, searchScope]);
+
+  // Filter files based on category tab & global search
   const filteredFiles = useMemo(() => {
+    const query = caseSensitive ? globalSearch.trim() : globalSearch.trim().toLowerCase();
+
     return files.filter((f) => {
-      if (fileFilter === 'java') return f.path.startsWith('src/') || f.path.endsWith('.java');
-      if (fileFilter === 'smali') return f.path.startsWith('smali/') || f.path.endsWith('.smali');
-      if (fileFilter === 'xml') return f.path.endsWith('.xml');
-      if (fileFilter === 'res') return f.path.startsWith('res/');
-      if (fileFilter === 'lib') return f.path.startsWith('lib/');
+      // 1. Type category filter
+      if (fileFilter === 'java' && !(f.path.startsWith('src/') || f.path.endsWith('.java'))) return false;
+      if (fileFilter === 'smali' && !(f.path.startsWith('smali/') || f.path.endsWith('.smali'))) return false;
+      if (fileFilter === 'xml' && !f.path.endsWith('.xml')) return false;
+      if (fileFilter === 'res' && !f.path.startsWith('res/')) return false;
+      if (fileFilter === 'lib' && !f.path.startsWith('lib/')) return false;
+
+      // 2. Global search filter
+      if (query !== '') {
+        const matchesName = caseSensitive
+          ? f.name.includes(query) || f.path.includes(query)
+          : f.name.toLowerCase().includes(query) || f.path.toLowerCase().includes(query);
+        const contentMatchCount = searchMatchStats.map.get(f.path) || 0;
+
+        if (searchScope === 'name') {
+          return matchesName;
+        } else if (searchScope === 'content') {
+          return contentMatchCount > 0;
+        } else {
+          return matchesName || contentMatchCount > 0;
+        }
+      }
+
       return true;
     });
-  }, [files, fileFilter]);
+  }, [files, fileFilter, globalSearch, caseSensitive, searchScope, searchMatchStats]);
 
   const fileTree = useMemo(() => {
-    return buildFileTree(filteredFiles, vulnerabilities);
-  }, [filteredFiles, vulnerabilities]);
+    return buildFileTree(filteredFiles, vulnerabilities, searchMatchStats.map);
+  }, [filteredFiles, vulnerabilities, searchMatchStats]);
+
+  // When global search finds results, auto expand all folders
+  useEffect(() => {
+    if (globalSearch.trim() !== '') {
+      const allFolders = new Set<string>();
+      const collect = (nodes: TreeNode[]) => {
+        nodes.forEach((n) => {
+          if (n.type === 'folder') {
+            allFolders.add(n.path);
+            collect(n.children);
+          }
+        });
+      };
+      collect(fileTree);
+      setExpandedFolders(allFolders);
+
+      // Auto-select first matching file if current file does not match
+      if (filteredFiles.length > 0 && !filteredFiles.some((f) => f.path === selectedFilePath)) {
+        setSelectedFilePath(filteredFiles[0].path);
+      }
+    }
+  }, [globalSearch, fileTree, filteredFiles, selectedFilePath]);
 
   const handleExpandAll = () => {
     const allFolders = new Set<string>();
@@ -359,11 +494,17 @@ export const CodeExplorerTab: React.FC<CodeExplorerTabProps> = ({
     });
   };
 
-  const handleSelectFile = (path: string) => {
+  const handleSelectFile = (path: string, jumpToLine?: number) => {
     setSelectedFilePath(path);
     setActiveTooltipFinding(null);
-    setHighlightedLine(null);
     expandPathAncestors(path);
+    if (jumpToLine !== undefined) {
+      setTimeout(() => {
+        scrollToLine(jumpToLine);
+      }, 100);
+    } else {
+      setHighlightedLine(null);
+    }
   };
 
   const activeFile = useMemo(() => {
@@ -465,9 +606,7 @@ export const CodeExplorerTab: React.FC<CodeExplorerTabProps> = ({
     }
   };
 
-  const filteredFlatFiles = filteredFiles.filter(
-    (f) => searchQuery === '' || f.path.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredFlatFiles = filteredFiles;
 
   const getSeverityBadgeClass = (severity: VulnerabilitySeverity) => {
     switch (severity) {
@@ -727,45 +866,145 @@ export const CodeExplorerTab: React.FC<CodeExplorerTabProps> = ({
         </div>
       )}
 
-      {/* Top Filter Bar & Actions */}
-      <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-2xl bg-slate-900 border border-slate-800">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-xs font-bold text-slate-400 uppercase font-mono mr-2 flex items-center gap-1">
-            <Filter className="w-3.5 h-3.5 text-cyan-400" />
-            Filter:
-          </span>
-          {[
-            { id: 'all', label: `All Files (${files.length})` },
-            { id: 'java', label: 'Java Source (AST)' },
-            { id: 'smali', label: 'Smali Bytecode' },
-            { id: 'xml', label: 'XML Manifest/Res' },
-            { id: 'res', label: 'Resources' },
-            { id: 'lib', label: 'Native (.so)' },
-          ].map((tab) => (
+      {/* Top Global Search & Filter Bar */}
+      <div className="p-3.5 rounded-2xl bg-slate-900 border border-slate-800 space-y-3 shadow-lg">
+        {/* Global Search Input Bar */}
+        <div className="flex flex-col md:flex-row items-stretch md:items-center gap-2.5">
+          <div className="relative flex-1">
+            <Search className="w-4 h-4 text-cyan-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              placeholder="Global Search: Search filenames, package paths, classes, methods, or string literals across decompiled source..."
+              value={globalSearch}
+              onChange={(e) => setGlobalSearch(e.target.value)}
+              className="w-full pl-10 pr-24 py-2 rounded-xl bg-slate-950 border border-cyan-500/30 text-xs sm:text-sm text-slate-100 placeholder-slate-500 font-mono focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400 transition"
+            />
+            {globalSearch && (
+              <button
+                onClick={() => setGlobalSearch('')}
+                className="absolute right-3 top-1/2 -translate-y-1/2 p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+                title="Clear global search"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          {/* Search Scopes & Options */}
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <div className="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs font-mono">
+              <button
+                onClick={() => setSearchScope('all')}
+                className={`px-2.5 py-1 rounded-lg transition cursor-pointer flex items-center gap-1 ${
+                  searchScope === 'all'
+                    ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+                title="Search both File Names and Source Code Text"
+              >
+                <AlignLeft className="w-3 h-3" />
+                <span>All</span>
+              </button>
+              <button
+                onClick={() => setSearchScope('name')}
+                className={`px-2.5 py-1 rounded-lg transition cursor-pointer flex items-center gap-1 ${
+                  searchScope === 'name'
+                    ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+                title="Search File Names & Paths only"
+              >
+                <FileCode className="w-3 h-3" />
+                <span>File Names</span>
+              </button>
+              <button
+                onClick={() => setSearchScope('content')}
+                className={`px-2.5 py-1 rounded-lg transition cursor-pointer flex items-center gap-1 ${
+                  searchScope === 'content'
+                    ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+                title="Search Code & Text Strings only"
+              >
+                <FileText className="w-3 h-3" />
+                <span>Code Content</span>
+              </button>
+            </div>
+
             <button
-              key={tab.id}
-              onClick={() => setFileFilter(tab.id as any)}
-              className={`px-3 py-1 rounded-lg text-xs font-mono transition cursor-pointer ${
-                fileFilter === tab.id
-                  ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
-                  : 'bg-slate-950 text-slate-400 hover:text-slate-200 border border-slate-800'
+              onClick={() => setCaseSensitive(!caseSensitive)}
+              className={`px-2.5 py-1.5 rounded-xl border text-xs font-mono transition cursor-pointer ${
+                caseSensitive
+                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 font-bold'
+                  : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200'
               }`}
+              title="Toggle Case Sensitivity (Aa)"
             >
-              {tab.label}
+              Aa
             </button>
-          ))}
+          </div>
         </div>
 
-        {analysisResult && (
-          <button
-            onClick={downloadAllAsZip}
-            disabled={zipping}
-            className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold text-xs shadow-md transition cursor-pointer disabled:opacity-50"
-          >
-            <Archive className="w-4 h-4" />
-            <span>{zipping ? 'Packaging ZIP...' : 'Download Decompiled Project (.ZIP)'}</span>
-          </button>
+        {/* Global Search Results Status Banner (When Active) */}
+        {globalSearch.trim() !== '' && (
+          <div className="flex items-center justify-between gap-2 p-2 px-3 rounded-xl bg-cyan-950/40 border border-cyan-500/30 text-xs font-mono">
+            <div className="flex items-center gap-2 text-cyan-300">
+              <Search className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+              <span>
+                Found <strong className="text-white font-bold">{searchMatchStats.totalMatches}</strong> match
+                {searchMatchStats.totalMatches === 1 ? '' : 'es'} across <strong className="text-white font-bold">{searchMatchStats.matchingFilesCount}</strong> file
+                {searchMatchStats.matchingFilesCount === 1 ? '' : 's'} for &ldquo;<span className="text-cyan-200 font-bold">{globalSearch}</span>&rdquo;
+              </span>
+            </div>
+            <button
+              onClick={() => setGlobalSearch('')}
+              className="text-[11px] text-slate-400 hover:text-white underline cursor-pointer"
+            >
+              Clear Search
+            </button>
+          </div>
         )}
+
+        {/* File Type Filters & ZIP Download Button */}
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-1 border-t border-slate-800/60">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-bold text-slate-400 uppercase font-mono mr-2 flex items-center gap-1">
+              <Filter className="w-3.5 h-3.5 text-cyan-400" />
+              Filter:
+            </span>
+            {[
+              { id: 'all', label: `All Files (${files.length})` },
+              { id: 'java', label: 'Java Source (AST)' },
+              { id: 'smali', label: 'Smali Bytecode' },
+              { id: 'xml', label: 'XML Manifest/Res' },
+              { id: 'res', label: 'Resources' },
+              { id: 'lib', label: 'Native (.so)' },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setFileFilter(tab.id as any)}
+                className={`px-3 py-1 rounded-lg text-xs font-mono transition cursor-pointer ${
+                  fileFilter === tab.id
+                    ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
+                    : 'bg-slate-950 text-slate-400 hover:text-slate-200 border border-slate-800'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          {analysisResult && (
+            <button
+              onClick={downloadAllAsZip}
+              disabled={zipping}
+              className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold text-xs shadow-md transition cursor-pointer disabled:opacity-50"
+            >
+              <Archive className="w-4 h-4" />
+              <span>{zipping ? 'Packaging ZIP...' : 'Download Decompiled Project (.ZIP)'}</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Main Grid: File Tree + Code Editor */}
@@ -800,19 +1039,19 @@ export const CodeExplorerTab: React.FC<CodeExplorerTabProps> = ({
             </div>
           </div>
 
-          {/* Search Box */}
+          {/* Quick Filter in Sidebar */}
           <div className="relative mb-2.5">
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
             <input
               type="text"
-              placeholder="Search files or folders..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Quick filter list..."
+              value={globalSearch}
+              onChange={(e) => setGlobalSearch(e.target.value)}
               className="w-full pl-8 pr-7 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder-slate-500 font-mono focus:outline-none focus:border-cyan-500"
             />
-            {searchQuery && (
+            {globalSearch && (
               <button
-                onClick={() => setSearchQuery('')}
+                onClick={() => setGlobalSearch('')}
                 className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
               >
                 <X className="w-3 h-3" />
@@ -849,49 +1088,81 @@ export const CodeExplorerTab: React.FC<CodeExplorerTabProps> = ({
                     onSelectFile={handleSelectFile}
                     expandedFolders={expandedFolders}
                     onToggleFolder={handleToggleFolder}
-                    searchQuery={searchQuery}
+                    searchQuery={globalSearch}
+                    searchScope={searchScope}
                   />
                 ))
               ) : (
                 <div className="p-4 text-center text-slate-500 text-xs">No matching files found</div>
               )
             ) : filteredFlatFiles.length > 0 ? (
-              filteredFlatFiles.map((file) => (
-                <div
-                  key={file.path}
-                  onClick={() => handleSelectFile(file.path)}
-                  className={`flex items-center justify-between p-2 rounded-lg cursor-pointer transition text-xs ${
-                    selectedFilePath === file.path
-                      ? 'bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-500/40'
-                      : 'text-slate-300 hover:bg-slate-800/60'
-                  }`}
-                >
-                  <div className="flex items-center gap-2 truncate">
-                    {file.language === 'xml' ? (
-                      <FileCode className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    ) : file.language === 'java' ? (
-                      <FileCode className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                    ) : file.language === 'smali' ? (
-                      <Binary className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                    ) : (
-                      <File className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                    )}
-                    <span className="truncate">{file.path}</span>
-                  </div>
-
-                  {file.retrievalScore !== undefined && (
-                    <span
-                      className={`text-[9px] font-mono px-1 py-0.2 rounded font-bold ${
-                        file.retrievalScore >= 95
-                          ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
-                          : 'bg-cyan-950 text-cyan-300 border border-cyan-800'
-                      }`}
+              filteredFlatFiles.map((file) => {
+                const matchCount = searchMatchStats.map.get(file.path) || 0;
+                const snippets = searchMatchStats.snippetsMap.get(file.path) || [];
+                return (
+                  <div
+                    key={file.path}
+                    className={`rounded-lg cursor-pointer transition text-xs border ${
+                      selectedFilePath === file.path
+                        ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300'
+                        : 'border-transparent text-slate-300 hover:bg-slate-800/60'
+                    }`}
+                  >
+                    <div
+                      onClick={() => handleSelectFile(file.path)}
+                      className="flex items-center justify-between p-2"
                     >
-                      {Math.round(file.retrievalScore)}%
-                    </span>
-                  )}
-                </div>
-              ))
+                      <div className="flex items-center gap-2 truncate">
+                        {file.language === 'xml' ? (
+                          <FileCode className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        ) : file.language === 'java' ? (
+                          <FileCode className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                        ) : file.language === 'smali' ? (
+                          <Binary className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        ) : (
+                          <File className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                        )}
+                        <span className="truncate">{file.path}</span>
+                      </div>
+
+                      <div className="flex items-center gap-1 shrink-0 ml-1">
+                        {globalSearch.trim() !== '' && matchCount > 0 && (
+                          <span className="text-[9px] font-mono px-1 py-0.2 rounded font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                            {matchCount} match{matchCount === 1 ? '' : 'es'}
+                          </span>
+                        )}
+                        {file.retrievalScore !== undefined && (
+                          <span
+                            className={`text-[9px] font-mono px-1 py-0.2 rounded font-bold ${
+                              file.retrievalScore >= 95
+                                ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                                : 'bg-cyan-950 text-cyan-300 border border-cyan-800'
+                            }`}
+                          >
+                            {Math.round(file.retrievalScore)}%
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Matching Code Line Snippets Preview in Flat View */}
+                    {globalSearch.trim() !== '' && snippets.length > 0 && (
+                      <div className="px-2 pb-2 space-y-1">
+                        {snippets.map((snip, idx) => (
+                          <div
+                            key={idx}
+                            onClick={() => handleSelectFile(file.path, snip.line)}
+                            className="text-[10px] font-mono p-1 rounded bg-slate-950/80 hover:bg-cyan-950/60 border border-slate-800 flex items-center justify-between gap-2 text-slate-400 hover:text-cyan-200 transition"
+                          >
+                            <span className="truncate">{snip.text}</span>
+                            <span className="text-amber-400 font-bold shrink-0">L{snip.line}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
             ) : (
               <div className="p-4 text-center text-slate-500 text-xs">No matching files found</div>
             )}
