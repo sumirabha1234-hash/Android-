@@ -1,0 +1,6 @@
+{
+  "name": "APK Guard 2.01",
+  "description": "Advanced APK decompiler with 0-100% source code recovery engine, CFG structuring & SSA type inference, isolated Android 14 sandbox dynamic analysis & payload download interceptor, permission danger matrix, signature inspector, secret & endpoint scanner, and vulnerability audit dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
